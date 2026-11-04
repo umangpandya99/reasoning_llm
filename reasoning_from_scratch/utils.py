@@ -1,18 +1,22 @@
 from pathlib import Path
 import sys
 import requests
+import json
+import time
+import warnings
 from urllib.parse import urlparse
-from reasoning_from_scratch.constants import *
-from reasoning_from_scratch.qwen3 import *
+from collections import Counter
 import torch
-from safetensors.torch import load_file
 from sympy import simplify
 from sympy.parsing import sympy_parser as spp
 from sympy.core.sympify import SympifyError
 from sympy.polys.polyerrors import PolynomialError
 from tokenize import TokenError
-import warnings
+from datasets import load_dataset
+from reasoning_from_scratch.constants import *
+from reasoning_from_scratch.qwen3 import *
 
+# Get the appropriate device for computation (GPU/CPU)
 def get_device(enable_tensor_cores=True):
  if torch.cuda.is_available():
     device = torch.device("cuda")
@@ -37,6 +41,7 @@ def get_device(enable_tensor_cores=True):
     print("Using CPU")
  return device
 
+# Error message for download failures
 def _download_error_message(filename, url, primary_error, backup_url=None, backup_error=None):
     details = [f"Failed to download {filename}."]
 
@@ -78,6 +83,7 @@ def _download_error_message(filename, url, primary_error, backup_url=None, backu
     )
     return "\n".join(details)
 
+# Download model files from primary and backup URLs
 def download_model(files,kind="base", repo="Qwen/Qwen3-0.6B",tokenizer_only=False, out_dir="."):
     if kind not in files:
         raise ValueError("kind must be 'base' or 'reasoning'")
@@ -90,6 +96,7 @@ def download_model(files,kind="base", repo="Qwen/Qwen3-0.6B",tokenizer_only=Fals
         backup = f"{backup_root}/{fname}"
         download_file(primary, out_dir=out_dir, backup_url=backup)
 
+# Download a single file from a URL with optional backup URL
 def download_file(url, out_dir=".", backup_url=None):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -152,7 +159,7 @@ def download_file(url, out_dir=".", backup_url=None):
     )
     raise RuntimeError(message) from (backup_error or primary_error)
 
-# Load Qwen3 model and tokenizer
+# Load model and tokenizer
 def load_model_and_tokenizer(
  which_model, device, use_compile, local_dir="../downloads"
 ):
@@ -183,6 +190,7 @@ def load_model_and_tokenizer(
     
     return model, tokenizer
 
+# Render a prompt using a predefined template
 def render_template(prompt):
     template = (
         "You are a helpful math assistant.\n"
@@ -192,6 +200,7 @@ def render_template(prompt):
     )
     return template
 
+# Basic text generation without caching
 @torch.inference_mode()
 def generate_text_basic_stream(model,token_ids,max_new_tokens,eos_token_id=None):
  model.eval()
@@ -205,6 +214,7 @@ def generate_text_basic_stream(model,token_ids,max_new_tokens,eos_token_id=None)
 
     token_ids = torch.cat([token_ids, next_token], dim=1)
 
+# Basic text generation with caching
 @torch.inference_mode()
 def generate_text_basic_stream_cache(model,token_ids,max_new_tokens,eos_token_id=None): 
     model.eval()
@@ -221,7 +231,7 @@ def generate_text_basic_stream_cache(model,token_ids,max_new_tokens,eos_token_id
         yield next_token
         out = model(next_token, cache=cache)[:, -1] 
 
-# A wrapper for streamed text generation
+# A wrapper for streamed text generation using basic stream with caching
 def generate_text_stream_concat(
  model, tokenizer, prompt, device, max_new_tokens,
  verbose=False,
@@ -249,36 +259,7 @@ def generate_text_stream_concat(
 
     return tokenizer.decode(generated_ids) 
 
-def generate_text_stream_concat_flex(
-        model, tokenizer, prompt, device, max_new_tokens,
-        verbose=False,
-        generate_func=None,
-        **generate_kwargs
-    ):
-    if generate_func is None:
-        generate_func = generate_text_basic_stream_cache
-
-    input_ids = torch.tensor(
-    tokenizer.encode(prompt), device=device
-    ).unsqueeze(0)
-    generated_ids = []
-    for token in generate_func(
-        model=model,
-        token_ids=input_ids,
-        max_new_tokens=max_new_tokens,
-        eos_token_id=tokenizer.eos_token_id,
-        **generate_kwargs,
-    ):
-        next_token_id = token.squeeze(0)
-        generated_ids.append(next_token_id.item())
-        if verbose:
-            print(
-            tokenizer.decode(next_token_id.tolist()),
-            end="",
-            flush=True
-            )
-    return tokenizer.decode(generated_ids)
-
+# Generate and print statistics for the output tokens and device memory usage
 def generate_stats(output_token_ids, tokenizer, start_time,
                    end_time):
     # tokenizer is currently unused but retained for backward compatibility
@@ -481,9 +462,7 @@ def grade_answer(pred_text, gt_text):
             )
     return result 
 
-from datasets import load_dataset
-import json
-
+# Load the MATH-500 test dataset, either from a local file or by downloading it from Hugging Face
 def load_math500_data(local_path="../downloads/math500_test.json", save_copy=True):
     local_path = Path(local_path)
 
@@ -509,16 +488,6 @@ def load_math500_data(local_path="../downloads/math500_test.json", save_copy=Tru
                 
     return math_data
 
-def render_template(prompt):
-    template = (
-        "You are a helpful math assistant.\n"
-        "Answer the question and write the final result on a new line as:\n"
-        "\\boxed{ANSWER}\n\n"
-        f"Question:\n{prompt}\n\nAnswer:"
-    )
-    return template
-
-import time
 def eta_progress_message( 
     processed,
     total,
@@ -625,7 +594,7 @@ def evaluate_math500_stream(
         
         return num_correct, num_examples, acc
 
-
+# Flexible text generation with optional custom generation function and additional keyword arguments
 def generate_text_stream_concat_flex(
         model, tokenizer, prompt, device, max_new_tokens,
         verbose=False,
@@ -662,7 +631,7 @@ def scale_logits_by_temperature(logits, temperature):
         raise ValueError("Temperature must be positive")
     return logits / temperature
 
-# Text generation with temperature scaling
+# Text generation with temperature scaling and caching
 @torch.inference_mode()
 def generate_text_temp_stream_cache(
     model,
@@ -694,6 +663,7 @@ def generate_text_temp_stream_cache(
         yield next_token
         out = model(next_token, cache=cache)[:, -1]
 
+
 def top_p_filter(probas, top_p):
     if top_p is None or top_p >= 1.0:
         return probas
@@ -714,6 +684,7 @@ def top_p_filter(probas, top_p):
     denom = torch.sum(filtered, dim=1, keepdim=True).clamp_min(1e-12)
     return filtered / denom
 
+# Text generation with top-p sampling and caching
 @torch.inference_mode()
 def generate_text_top_p_stream_cache(
  model,
@@ -743,7 +714,7 @@ def generate_text_top_p_stream_cache(
     yield next_token
     out = model(next_token, cache=cache)[:, -1]
 
-from collections import Counter
+# Self-consistency voting mechanism for multiple generated answers
 def self_consistency_vote(
     model, tokenizer, prompt, device,
     num_samples=10, temperature=0.8, top_p=0.9, max_new_tokens=2048,
