@@ -3,8 +3,39 @@ import sys
 import requests
 from urllib.parse import urlparse
 from reasoning_from_scratch.constants import *
+from reasoning_from_scratch.qwen3 import *
 import torch
 from safetensors.torch import load_file
+from sympy import simplify
+from sympy.parsing import sympy_parser as spp
+from sympy.core.sympify import SympifyError
+from sympy.polys.polyerrors import PolynomialError
+from tokenize import TokenError
+import warnings
+
+def get_device(enable_tensor_cores=True):
+ if torch.cuda.is_available():
+    device = torch.device("cuda")
+    print("Using NVIDIA CUDA GPU")
+
+    if enable_tensor_cores:
+        major, minor = map(int, torch.__version__.split(".")[:2])
+        if (major, minor) >= (2, 9):
+            torch.backends.cuda.matmul.fp32_precision = "tf32"
+            torch.backends.cudnn.conv.fp32_precision = "tf32"
+        else:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+ elif torch.backends.mps.is_available():
+    device = torch.device("mps")
+    print("Using Apple Silicon GPU (MPS)")
+ elif torch.xpu.is_available():
+    device = torch.device("xpu")
+    print("Using Intel GPU")
+ else:
+    device = torch.device("cpu")
+    print("Using CPU")
+ return device
 
 def _download_error_message(filename, url, primary_error, backup_url=None, backup_error=None):
     details = [f"Failed to download {filename}."]
@@ -47,11 +78,10 @@ def _download_error_message(filename, url, primary_error, backup_url=None, backu
     )
     return "\n".join(details)
 
-def download_qwen3(files,kind="base", tokenizer_only=False, out_dir="."):
+def download_model(files,kind="base", repo="Qwen/Qwen3-0.6B",tokenizer_only=False, out_dir="."):
     if kind not in files:
         raise ValueError("kind must be 'base' or 'reasoning'")
-
-    hf_fmt = "https://huggingface.co/{repo}/resolve/main/{file}"
+    
     targets = ["tokenizer"] if tokenizer_only else ["model", "tokenizer"]
 
     for key in targets:
@@ -122,34 +152,643 @@ def download_file(url, out_dir=".", backup_url=None):
     )
     raise RuntimeError(message) from (backup_error or primary_error)
 
-def get_device(enable_tensor_cores=True):
- if torch.cuda.is_available():
-    device = torch.device("cuda")
-    print("Using NVIDIA CUDA GPU")
-
-    if enable_tensor_cores:
-        major, minor = map(int, torch.__version__.split(".")[:2])
-        if (major, minor) >= (2, 9):
-            torch.backends.cuda.matmul.fp32_precision = "tf32"
-            torch.backends.cudnn.conv.fp32_precision = "tf32"
-        else:
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
- elif torch.backends.mps.is_available():
-    device = torch.device("mps")
-    print("Using Apple Silicon GPU (MPS)")
- elif torch.xpu.is_available():
-    device = torch.device("xpu")
-    print("Using Intel GPU")
- else:
-    device = torch.device("cpu")
-    print("Using CPU")
- return device
-
-def convert_safetensors_to_pth(input_path, output_path):
-    # Load weights from safetensors
-    state_dict = load_file(input_path)
+# Load Qwen3 model and tokenizer
+def load_model_and_tokenizer(
+ which_model, device, use_compile, local_dir="../downloads"
+):
+    if which_model == "base":
+        # download_model(FILES, kind="base", tokenizer_only=False, out_dir=local_dir)
+        print(f"Loading base model from {Path(local_dir)}")
+        tokenizer_path = Path(local_dir) / "tokenizer-base.json"
+        model_path = Path(local_dir) / "qwen3-0.6B-base.pth"
+        tokenizer = Qwen3Tokenizer(tokenizer_file_path=tokenizer_path)
     
-    # Save as PyTorch .pth file
-    torch.save(state_dict, output_path)
-    print(f"Successfully converted {input_path} to {output_path}")
+    elif which_model == "reasoning":
+        # download_model(FILES, kind="reasoning", tokenizer_only=False, out_dir=local_dir)
+        
+        tokenizer_path = Path(local_dir) / "tokenizer-reasoning.json"
+        model_path = Path(local_dir) / "qwen3-0.6B-reasoning.pth"
+
+        tokenizer = Qwen3Tokenizer(tokenizer_file_path=tokenizer_path,apply_chat_template=True,add_generation_prompt=True,add_thinking=True,)
+    else:
+        raise ValueError(f"Invalid choice: which_model={which_model}")
+    
+    model = Qwen3Model(QWEN_CONFIG_06_B)
+    model.load_state_dict(torch.load(model_path))
+    model.to(device)
+    
+    if use_compile:
+        torch._dynamo.config.allow_unspec_int_on_nn_module = True
+        model = torch.compile(model)
+    
+    return model, tokenizer
+
+def render_template(prompt):
+    template = (
+        "You are a helpful math assistant.\n"
+        "Answer the question and write the final result on a new line as:\n"
+        "\\boxed{ANSWER}\n\n"
+        f"Question:\n{prompt}\n\nAnswer:"
+    )
+    return template
+
+@torch.inference_mode()
+def generate_text_basic_stream(model,token_ids,max_new_tokens,eos_token_id=None):
+ model.eval()
+ for _ in range(max_new_tokens):
+    out = model(token_ids)[:, -1]
+    next_token = torch.argmax(out, dim=-1, keepdim=True)
+    
+    if (eos_token_id is not None and torch.all(next_token == eos_token_id)):
+        break
+    yield next_token
+
+    token_ids = torch.cat([token_ids, next_token], dim=1)
+
+@torch.inference_mode()
+def generate_text_basic_stream_cache(model,token_ids,max_new_tokens,eos_token_id=None): 
+    model.eval()
+    cache = KVCache(n_layers=model.cfg["n_layers"])
+    model.reset_kv_cache()
+
+    out = model(token_ids, cache=cache)[:, -1]
+    for _ in range(max_new_tokens):
+        next_token = torch.argmax(out, dim=-1, keepdim=True)
+    
+        if (eos_token_id is not None and torch.all(next_token == eos_token_id)):
+            break
+    
+        yield next_token
+        out = model(next_token, cache=cache)[:, -1] 
+
+# A wrapper for streamed text generation
+def generate_text_stream_concat(
+ model, tokenizer, prompt, device, max_new_tokens,
+ verbose=False,
+):
+    
+    input_ids = torch.tensor(
+        tokenizer.encode(prompt), device=device
+    ).unsqueeze(0) 
+    generated_ids = []
+    
+    for token in generate_text_basic_stream_cache(
+        model=model,
+        token_ids=input_ids,
+        max_new_tokens=max_new_tokens,
+        eos_token_id=tokenizer.eos_token_id
+    ):
+        next_token_id = token.squeeze(0)
+        generated_ids.append(next_token_id.item())
+        if verbose:
+            print(
+                tokenizer.decode(next_token_id.tolist()),
+                end="",
+                flush=True
+            )
+
+    return tokenizer.decode(generated_ids) 
+
+def generate_text_stream_concat_flex(
+        model, tokenizer, prompt, device, max_new_tokens,
+        verbose=False,
+        generate_func=None,
+        **generate_kwargs
+    ):
+    if generate_func is None:
+        generate_func = generate_text_basic_stream_cache
+
+    input_ids = torch.tensor(
+    tokenizer.encode(prompt), device=device
+    ).unsqueeze(0)
+    generated_ids = []
+    for token in generate_func(
+        model=model,
+        token_ids=input_ids,
+        max_new_tokens=max_new_tokens,
+        eos_token_id=tokenizer.eos_token_id,
+        **generate_kwargs,
+    ):
+        next_token_id = token.squeeze(0)
+        generated_ids.append(next_token_id.item())
+        if verbose:
+            print(
+            tokenizer.decode(next_token_id.tolist()),
+            end="",
+            flush=True
+            )
+    return tokenizer.decode(generated_ids)
+
+def generate_stats(output_token_ids, tokenizer, start_time,
+                   end_time):
+    # tokenizer is currently unused but retained for backward compatibility
+    total_time = end_time - start_time
+    print(f"\n\nTime: {total_time:.2f} sec")
+    print(f"{round(output_token_ids.numel() / total_time,2)} tokens/sec")
+
+    for name, backend in (("CUDA", getattr(torch, "cuda", None)),
+                          ("XPU", getattr(torch, "xpu", None))):
+        if backend is not None and backend.is_available():
+
+            # Check whether we are actually using this backend
+            device_type = output_token_ids.device.type
+            if device_type != name.lower():
+                warnings.warn(
+                    f"{name} is available but tensors are on "
+                    f"{device_type}. Memory stats may be 0."
+                )
+    
+            # Synchronize if supported (important for async backends)
+            if hasattr(backend, "synchronize"):
+                backend.synchronize()
+            
+            max_mem_bytes = backend.max_memory_allocated()
+            max_mem_gb = max_mem_bytes / (1024 ** 3)
+            print(f"Max {name} memory allocated: {max_mem_gb:.2f} GB")
+            backend.reset_peak_memory_stats()
+
+def get_last_boxed(text):
+    boxed_start_idx = text.rfind(r"\boxed")
+    if boxed_start_idx == -1:
+        return None
+    current_idx = boxed_start_idx + len(r"\boxed")
+
+    while current_idx < len(text) and text[current_idx].isspace():
+        current_idx += 1
+
+    if current_idx >= len(text) or text[current_idx] != "{":
+        return None
+    current_idx += 1
+    brace_depth = 1
+    content_start_idx = current_idx
+
+    while current_idx < len(text) and brace_depth > 0:
+        char = text[current_idx]
+        if char == "{":
+            brace_depth += 1
+        elif char == "}":
+            brace_depth -= 1
+        current_idx += 1
+
+    if brace_depth != 0:
+        return None
+
+    return text[content_start_idx:current_idx-1]
+
+def extract_final_candidate(text, fallback="number_then_full"):
+    result = ""
+    if text:
+        boxed = get_last_boxed(text.strip())
+    if boxed:
+        result = boxed.strip().strip("$ ")
+    elif fallback in ("number_then_full", "number_only"):
+        m = RE_NUMBER.findall(text)
+        if m:
+            result = m[-1]
+        elif fallback == "number_then_full":
+            result = text
+    return result
+
+def normalize_text(text):
+    if not text:
+        return ""
+    text = RE_SPECIAL.sub("", text).strip()
+
+    match = re.match(r"^[A-Za-z]\s*[.:]\s*(.+)$", text)
+    if match:
+        text = match.group(1)
+    text = re.sub(r"\^\s*\{\s*\\circ\s*\}", "", text)
+    text = re.sub(r"\^\s*\\circ", "", text)
+    text = text.replace("°", "")
+    match = re.match(r"^\\text\{(?P<x>.+?)\}$", text)
+    if match:
+        text = match.group("x")
+    text = re.sub(r"\\\(|\\\)|\\\[|\\\]", "", text)
+
+    for pat, rep in LATEX_FIXES:
+        text = re.sub(pat, rep, text)
+
+    def convert_superscripts(s, base=None):
+        converted = "".join(
+        SUPERSCRIPT_MAP[ch] if ch in SUPERSCRIPT_MAP else ch
+        for ch in s)
+        if base is None:
+            return converted
+        return f"{base}**{converted}"
+
+    text = re.sub(
+        r"([0-9A-Za-z\)\]\}])([⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻]+)",
+        lambda m: convert_superscripts(m.group(2), base=m.group(1)),
+        text,
+    )
+    text = convert_superscripts(text)
+
+    text = text.replace("\\%", "%").replace("$", "").replace("%", "")
+    text = re.sub(
+        r"\\sqrt\s*\{([^}]*)\}",
+        lambda match: f"sqrt({match.group(1)})",
+        text,
+    )
+    text = re.sub(
+        r"\\sqrt\s+([^\\\s{}]+)",
+        lambda match: f"sqrt({match.group(1)})",
+        text,
+    )
+
+    text = re.sub(
+        r"\\frac\s*\{([^{}]+)\}\s*\{([^{}]+)\}",
+        lambda match: f"({match.group(1)})/({match.group(2)})",
+        text,
+    )
+    text = re.sub(
+        r"\\frac\s+([^\s{}]+)\s+([^\s{}]+)",
+        lambda match: f"({match.group(1)})/({match.group(2)})",
+        text,
+    )
+
+    text = text.replace("^", "**")
+    text = re.sub(
+        r"(?<=\d)\s+(\d+/\d+)",
+        lambda match: "+" + match.group(1),
+        text,
+    )
+
+    text = re.sub(
+        r"(?<=\d),(?=\d\d\d(\D|$))",
+        "",
+        text,
+    )
+    return text.replace("{", "").replace("}", "").strip().lower()
+
+
+def sympy_parser(expr):
+    if expr is None or len(expr) > 2000:
+        return None
+    try:
+        return spp.parse_expr(
+            expr,
+            transformations=(
+                *spp.standard_transformations,
+                spp.implicit_multiplication_application,
+            ),
+            evaluate=True,
+        )
+    except (SympifyError, SyntaxError, TypeError, AttributeError,
+            IndexError, TokenError, ValueError, PolynomialError):
+        return None
+
+def equality_check(expr_gtruth, expr_pred):
+    if expr_gtruth == expr_pred:
+        return True
+
+    gtruth, pred = sympy_parser(expr_gtruth), sympy_parser(expr_pred)
+    if gtruth is not None and pred is not None:
+        try:
+            return simplify(gtruth - pred) == 0
+        except (SympifyError, TypeError):
+            pass
+    return False
+
+def split_into_parts(text):
+    result = [text]
+    if text:
+        if (
+        len(text) >= 2
+        and text[0] in "([" and text[-1] in ")]"
+        and "," in text[1:-1]
+        ):
+            items = [p.strip() for p in text[1:-1].split(",")]
+            if all(items):
+                result = items
+    else:
+        result = []
+    return result
+
+def grade_answer(pred_text, gt_text):
+    result = False
+    if pred_text is not None and gt_text is not None:
+        gt_parts = split_into_parts(
+            normalize_text(gt_text)
+        )
+        pred_parts = split_into_parts(
+            normalize_text(pred_text)
+        )
+        if (gt_parts and pred_parts
+        and len(gt_parts) == len(pred_parts)):
+            result = all(
+                equality_check(gt, pred)
+                for gt, pred in zip(gt_parts, pred_parts)
+            )
+    return result 
+
+from datasets import load_dataset
+import json
+
+def load_math500_data(local_path="../downloads/math500_test.json", save_copy=True):
+    local_path = Path(local_path)
+
+    # 1. Load from local file if it exists
+    if local_path.exists():
+        with local_path.open("r", encoding="utf-8") as f:
+            math_data = json.load(f)
+    else:
+        # 2. Download from Hugging Face
+        dataset = load_dataset("HuggingFaceH4/MATH-500", split="test")
+        
+        # Convert to a standard Python list of dicts
+        math_data = dataset.to_list() if hasattr(dataset, "to_list") else list(dataset)
+        
+        # 3. Save a local copy if requested
+        if save_copy:
+            # Ensure the parent directory (e.g., '../downloads') actually exists
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Since math_data is now a list, use standard json.dump
+            with local_path.open("w", encoding="utf-8") as f:
+                json.dump(math_data, f, ensure_ascii=False, indent=4)
+                
+    return math_data
+
+def render_template(prompt):
+    template = (
+        "You are a helpful math assistant.\n"
+        "Answer the question and write the final result on a new line as:\n"
+        "\\boxed{ANSWER}\n\n"
+        f"Question:\n{prompt}\n\nAnswer:"
+    )
+    return template
+
+import time
+def eta_progress_message( 
+    processed,
+    total,
+    start_time,
+    show_eta=False,
+    label="Progress",
+    ):
+    progress = f"{label}: {processed}/{total}"
+    pad_width = len(f"{label}: {total}/{total} | ETA: 00h 00m 00s")
+    if not show_eta or processed <= 0:
+        return progress.ljust(pad_width)
+    elapsed = time.time() - start_time
+    
+    if elapsed <= 0:
+        return progress.ljust(pad_width)
+    
+    remaining = max(total - processed, 0)
+    
+    if processed:
+        avg_time = elapsed / processed
+        eta_seconds = avg_time * remaining
+    else:
+        eta_seconds = 0
+    
+    eta_seconds = max(int(round(eta_seconds)), 0)
+    minutes, rem_seconds = divmod(eta_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        eta = f"{hours}h {minutes:02d}m {rem_seconds:02d}s"
+    elif minutes:
+        eta = f"{minutes:02d}m {rem_seconds:02d}s"
+    else:
+        eta = f"{rem_seconds:02d}s"
+    
+    message = f"{progress} | ETA: {eta}"
+    return message.ljust(pad_width)
+
+def evaluate_math500_stream(
+        model,
+        tokenizer,
+        device,
+        math_data,
+        out_path=None,
+        max_new_tokens=512,
+        verbose = False
+):
+    # save to output path
+    if out_path is None:
+        dev_name = str(device).replace(":", "-")
+        out_path = Path(f"math500-{dev_name}.jsonl")
+
+    num_examples = len(math_data)
+    num_correct = 0
+    start_time = time.time()
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        # render template , generate ansewer, extract answer and grade
+        for i, example in enumerate(math_data, start=1):
+            prompt = render_template(example['problem'])
+            model_answer = generate_text_stream_concat(
+                model, tokenizer, prompt, device,
+                max_new_tokens=max_new_tokens,
+                verbose=verbose
+            )
+            extracted = extract_final_candidate(model_answer)
+            is_correct = grade_answer(extracted, example['answer'])
+
+            num_correct += int(is_correct)
+
+            # save the current example's evaluation record to the output file
+            record = {
+            "index": i,
+            "problem": example["problem"],
+            "gtruth_answer": example["answer"],
+            "generated_text": model_answer,
+            "extracted": extracted,
+            "correct": bool(is_correct),
+            }
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+            # print progress for the current example
+            progress_msg = eta_progress_message(
+                processed=i,
+                total=num_examples,
+                start_time=start_time,
+                show_eta=True,
+                label="MATH-500",
+            )
+            print(progress_msg, end="\r", flush=True)
+
+            if verbose:
+                print(
+                f"\n\n{'='*50}\n{progress_msg}\n"
+                f"{'='*50}\nExtracted: {extracted}\n"
+                f"Expected: {example['answer']}\n"
+                f"Correct so far: {num_correct}\n{'-'*50}"
+                )
+
+        seconds_elapsed = time.time() - start_time
+        acc = num_correct / num_examples if num_examples else 0.0
+        print(f"\nAccuracy: {acc*100:.1f}% ({num_correct}/{num_examples})")
+        print(f"Total time: {seconds_elapsed/60:.1f} min")
+        print(f"Logs written to: {out_path}")
+        
+        return num_correct, num_examples, acc
+
+
+def generate_text_stream_concat_flex(
+        model, tokenizer, prompt, device, max_new_tokens,
+        verbose=False,
+        generate_func=None,
+        **generate_kwargs
+    ):
+    if generate_func is None:
+        generate_func = generate_text_basic_stream_cache
+
+    input_ids = torch.tensor(
+    tokenizer.encode(prompt), device=device
+    ).unsqueeze(0)
+    generated_ids = []
+    for token in generate_func(
+        model=model,
+        token_ids=input_ids,
+        max_new_tokens=max_new_tokens,
+        eos_token_id=tokenizer.eos_token_id,
+        **generate_kwargs,
+    ):
+        next_token_id = token.squeeze(0)
+        generated_ids.append(next_token_id.item())
+        if verbose:
+            print(
+            tokenizer.decode(next_token_id.tolist()),
+            end="",
+            flush=True
+            )
+    return tokenizer.decode(generated_ids)
+
+# scale the logits 
+def scale_logits_by_temperature(logits, temperature):
+    if temperature <= 0:
+        raise ValueError("Temperature must be positive")
+    return logits / temperature
+
+# Text generation with temperature scaling
+@torch.inference_mode()
+def generate_text_temp_stream_cache(
+    model,
+    token_ids,
+    max_new_tokens,
+    eos_token_id=None,
+    temperature=0.
+):
+    model.eval()
+    cache = KVCache(n_layers=model.cfg["n_layers"])
+    model.reset_kv_cache()
+    out = model(token_ids, cache=cache)[:, -1]
+    for _ in range(max_new_tokens):
+    # NEW:
+    # ########################################
+        orig_device = token_ids.device
+        if temperature is None or temperature == 0.0:
+            next_token = torch.argmax(out, dim=-1, keepdim=True)
+        else:
+            logits = scale_logits_by_temperature(out, temperature)
+            probas = torch.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probas.cpu(), num_samples=1)
+            next_token = next_token.to(orig_device)
+    
+    #########################################
+
+        if (eos_token_id is not None and torch.all(next_token == eos_token_id)):
+            break
+        yield next_token
+        out = model(next_token, cache=cache)[:, -1]
+
+def top_p_filter(probas, top_p):
+    if top_p is None or top_p >= 1.0:
+        return probas
+    
+    sorted_probas, sorted_idx = torch.sort(probas, dim=1, descending=True)
+    cumprobas = torch.cumsum(sorted_probas, dim=1) 
+    prefix = cumprobas - sorted_probas
+    keep = prefix < top_p
+    keep[:, 0] = True
+    
+    kept_sorted = torch.where(
+        keep, sorted_probas,
+        torch.zeros_like(sorted_probas)
+    )
+
+    filtered = torch.zeros_like(probas).scatter(1, sorted_idx, kept_sorted)
+    
+    denom = torch.sum(filtered, dim=1, keepdim=True).clamp_min(1e-12)
+    return filtered / denom
+
+@torch.inference_mode()
+def generate_text_top_p_stream_cache(
+ model,
+ token_ids,
+ max_new_tokens,
+ eos_token_id=None,
+ temperature=0.,
+ top_p=None
+):
+ model.eval()
+ cache = KVCache(n_layers=model.cfg["n_layers"])
+ model.reset_kv_cache()
+ out = model(token_ids, cache=cache)[:, -1]
+ for _ in range(max_new_tokens):    
+    orig_device = token_ids.device
+    if temperature is None or temperature == 0.0:
+        next_token = torch.argmax(out, dim=-1, keepdim=True)
+    else:
+        logits = scale_logits_by_temperature(out, temperature)
+        probas = torch.softmax(logits, dim=-1)
+        probas = top_p_filter(probas, top_p)
+        next_token = torch.multinomial(probas.cpu(), num_samples=1)
+        next_token = next_token.to(orig_device)
+
+    if (eos_token_id is not None and torch.all(next_token == eos_token_id)):
+        break
+    yield next_token
+    out = model(next_token, cache=cache)[:, -1]
+
+from collections import Counter
+def self_consistency_vote(
+    model, tokenizer, prompt, device,
+    num_samples=10, temperature=0.8, top_p=0.9, max_new_tokens=2048,
+    show_progress=True, show_long_answer=False, seed=None,
+):
+    full_answers, short_answers = [], []
+    
+    for i in range(num_samples):
+        if seed is not None:
+            torch.manual_seed(seed + i + 1)
+
+        answer = generate_text_stream_concat_flex(
+            model=model, tokenizer=tokenizer, prompt=prompt, device=device,
+            max_new_tokens=max_new_tokens, verbose=show_long_answer,
+            generate_func=generate_text_top_p_stream_cache,
+            temperature=temperature, top_p=top_p,
+        )
+
+        short = extract_final_candidate(
+        answer, fallback="number_then_full"
+        )
+        full_answers.append(answer)
+        short_answers.append(short)
+        if show_progress:
+            print(f"[Sample {i+1}/{num_samples}] → {short!r}")
+    
+    counts = Counter(short_answers)
+    groups = {s: [] for s in counts}
+    for idx, s in enumerate(short_answers):
+        groups[s].append(idx)
+    
+    mc = counts.most_common()
+    if not mc:
+        majority_winners, final_answer = [], None
+    else:
+        top_freq = mc[0][1]
+        majority_winners = [s for s, f in mc if f == top_freq]
+        final_answer = mc[0][0] if len(majority_winners) == 1 else None
+    
+    return {
+    "full_answers": full_answers,
+    "short_answers": short_answers,
+    "counts": dict(counts),
+    "groups": groups,
+    "majority_winners": majority_winners,
+    "final_answer": final_answer,
+    }
+ 
