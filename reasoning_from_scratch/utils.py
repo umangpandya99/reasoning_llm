@@ -7,6 +7,7 @@ import warnings
 from urllib.parse import urlparse
 from collections import Counter
 import torch
+import math
 from sympy import simplify
 from sympy.parsing import sympy_parser as spp
 from sympy.core.sympify import SympifyError
@@ -200,67 +201,8 @@ def render_template(prompt):
     )
     return template
 
-# Basic text generation without caching
-@torch.inference_mode()
-def generate_text_basic_stream(model,token_ids,max_new_tokens,eos_token_id=None):
- model.eval()
- for _ in range(max_new_tokens):
-    out = model(token_ids)[:, -1]
-    next_token = torch.argmax(out, dim=-1, keepdim=True)
-    
-    if (eos_token_id is not None and torch.all(next_token == eos_token_id)):
-        break
-    yield next_token
-
-    token_ids = torch.cat([token_ids, next_token], dim=1)
-
-# Basic text generation with caching
-@torch.inference_mode()
-def generate_text_basic_stream_cache(model,token_ids,max_new_tokens,eos_token_id=None): 
-    model.eval()
-    cache = KVCache(n_layers=model.cfg["n_layers"])
-    model.reset_kv_cache()
-
-    out = model(token_ids, cache=cache)[:, -1]
-    for _ in range(max_new_tokens):
-        next_token = torch.argmax(out, dim=-1, keepdim=True)
-    
-        if (eos_token_id is not None and torch.all(next_token == eos_token_id)):
-            break
-    
-        yield next_token
-        out = model(next_token, cache=cache)[:, -1] 
-
-# A wrapper for streamed text generation using basic stream with caching
-def generate_text_stream_concat(
- model, tokenizer, prompt, device, max_new_tokens,
- verbose=False,
-):
-    
-    input_ids = torch.tensor(
-        tokenizer.encode(prompt), device=device
-    ).unsqueeze(0) 
-    generated_ids = []
-    
-    for token in generate_text_basic_stream_cache(
-        model=model,
-        token_ids=input_ids,
-        max_new_tokens=max_new_tokens,
-        eos_token_id=tokenizer.eos_token_id
-    ):
-        next_token_id = token.squeeze(0)
-        generated_ids.append(next_token_id.item())
-        if verbose:
-            print(
-                tokenizer.decode(next_token_id.tolist()),
-                end="",
-                flush=True
-            )
-
-    return tokenizer.decode(generated_ids) 
-
 # Generate and print statistics for the output tokens and device memory usage
-def generate_stats(output_token_ids, tokenizer, start_time,
+def generate_stats(output_token_ids, start_time,
                    end_time):
     # tokenizer is currently unused but retained for backward compatibility
     total_time = end_time - start_time
@@ -547,10 +489,11 @@ def evaluate_math500_stream(
         # render template , generate ansewer, extract answer and grade
         for i, example in enumerate(math_data, start=1):
             prompt = render_template(example['problem'])
-            model_answer = generate_text_stream_concat(
+            model_answer = generate_text_stream_concat_flex(
                 model, tokenizer, prompt, device,
                 max_new_tokens=max_new_tokens,
-                verbose=verbose
+                verbose=verbose,
+                generate_func=generate_text_basic_stream_cache,
             )
             extracted = extract_final_candidate(model_answer)
             is_correct = grade_answer(extracted, example['answer'])
@@ -593,6 +536,80 @@ def evaluate_math500_stream(
         print(f"Logs written to: {out_path}")
         
         return num_correct, num_examples, acc
+
+# Basic text generation without caching
+@torch.inference_mode()
+def generate_text_basic_stream(model,token_ids,max_new_tokens,eos_token_id=None):
+ model.eval()
+ start_time = time.time()
+ generated_tokens = []
+ try:
+    for _ in range(max_new_tokens):
+        out = model(token_ids)[:, -1]
+        next_token = torch.argmax(out, dim=-1, keepdim=True)
+        
+        if (eos_token_id is not None and torch.all(next_token == eos_token_id)):
+            break
+        generated_tokens.append(next_token)
+        yield next_token
+
+        token_ids = torch.cat([token_ids, next_token], dim=1)
+ finally:
+    output_token_ids = torch.cat(generated_tokens, dim=1) if generated_tokens else token_ids[:, :0]
+    generate_stats(output_token_ids, start_time, time.time())
+
+# Basic text generation with caching
+@torch.inference_mode()
+def generate_text_basic_stream_cache(model,token_ids,max_new_tokens,eos_token_id=None): 
+    model.eval()
+    cache = KVCache(n_layers=model.cfg["n_layers"])
+    model.reset_kv_cache()
+    start_time = time.time()
+    generated_tokens = []
+
+    try:
+        out = model(token_ids, cache=cache)[:, -1]
+        for _ in range(max_new_tokens):
+            next_token = torch.argmax(out, dim=-1, keepdim=True)
+        
+            if (eos_token_id is not None and torch.all(next_token == eos_token_id)):
+                break
+        
+            generated_tokens.append(next_token)
+            yield next_token
+            out = model(next_token, cache=cache)[:, -1]
+    finally:
+        output_token_ids = torch.cat(generated_tokens, dim=1) if generated_tokens else token_ids[:, :0]
+        generate_stats(output_token_ids, start_time, time.time())
+
+# A wrapper for streamed text generation using basic stream with caching
+# Not useful since we have generate_text_stream_concat_flex
+# def generate_text_stream_concat(
+#  model, tokenizer, prompt, device, max_new_tokens,
+#  verbose=False,
+# ):
+    
+#     input_ids = torch.tensor(
+#         tokenizer.encode(prompt), device=device
+#     ).unsqueeze(0) 
+#     generated_ids = []
+    
+#     for token in generate_text_basic_stream_cache(
+#         model=model,
+#         token_ids=input_ids,
+#         max_new_tokens=max_new_tokens,
+#         eos_token_id=tokenizer.eos_token_id
+#     ):
+#         next_token_id = token.squeeze(0)
+#         generated_ids.append(next_token_id.item())
+#         if verbose:
+#             print(
+#                 tokenizer.decode(next_token_id.tolist()),
+#                 end="",
+#                 flush=True
+#             )
+
+#     return tokenizer.decode(generated_ids) 
 
 # Flexible text generation with optional custom generation function and additional keyword arguments
 def generate_text_stream_concat_flex(
@@ -643,26 +660,34 @@ def generate_text_temp_stream_cache(
     model.eval()
     cache = KVCache(n_layers=model.cfg["n_layers"])
     model.reset_kv_cache()
-    out = model(token_ids, cache=cache)[:, -1]
-    for _ in range(max_new_tokens):
-    # NEW:
-    # ########################################
-        orig_device = token_ids.device
-        if temperature is None or temperature == 0.0:
-            next_token = torch.argmax(out, dim=-1, keepdim=True)
-        else:
-            logits = scale_logits_by_temperature(out, temperature)
-            probas = torch.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probas.cpu(), num_samples=1)
-            next_token = next_token.to(orig_device)
-    
-    #########################################
+    start_time = time.time()
+    generated_tokens = []
 
-        if (eos_token_id is not None and torch.all(next_token == eos_token_id)):
-            break
-        yield next_token
-        out = model(next_token, cache=cache)[:, -1]
+    try:
+        out = model(token_ids, cache=cache)[:, -1]
+        for _ in range(max_new_tokens):
+        # NEW:
+        ########################################
+            orig_device = token_ids.device
+            if temperature is None or temperature == 0.0:
+                next_token = torch.argmax(out, dim=-1, keepdim=True)
+            else:
+                logits = scale_logits_by_temperature(out, temperature)
+                probas = torch.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probas.cpu(), num_samples=1)
+                next_token = next_token.to(orig_device)
+            #########################################
 
+            if (eos_token_id is not None and torch.all(next_token == eos_token_id)):
+                break
+
+            generated_tokens.append(next_token)
+            
+            yield next_token
+            out = model(next_token, cache=cache)[:, -1]       
+    finally:
+        output_token_ids = torch.cat(generated_tokens, dim=1) if generated_tokens else token_ids[:, :0]
+        generate_stats(output_token_ids, start_time, time.time())
 
 def top_p_filter(probas, top_p):
     if top_p is None or top_p >= 1.0:
@@ -687,32 +712,45 @@ def top_p_filter(probas, top_p):
 # Text generation with top-p sampling and caching
 @torch.inference_mode()
 def generate_text_top_p_stream_cache(
- model,
- token_ids,
- max_new_tokens,
- eos_token_id=None,
- temperature=0.,
- top_p=None
+    model,
+    token_ids,
+    max_new_tokens,
+    eos_token_id=None,
+    temperature=0.,
+    top_p=None
 ):
- model.eval()
- cache = KVCache(n_layers=model.cfg["n_layers"])
- model.reset_kv_cache()
- out = model(token_ids, cache=cache)[:, -1]
- for _ in range(max_new_tokens):    
-    orig_device = token_ids.device
-    if temperature is None or temperature == 0.0:
-        next_token = torch.argmax(out, dim=-1, keepdim=True)
-    else:
-        logits = scale_logits_by_temperature(out, temperature)
-        probas = torch.softmax(logits, dim=-1)
-        probas = top_p_filter(probas, top_p)
-        next_token = torch.multinomial(probas.cpu(), num_samples=1)
-        next_token = next_token.to(orig_device)
+    model.eval()
+    cache = KVCache(n_layers=model.cfg["n_layers"])
+    model.reset_kv_cache()
+    start_time = time.time()
+    generated_tokens = []
+    try:
 
-    if (eos_token_id is not None and torch.all(next_token == eos_token_id)):
-        break
-    yield next_token
-    out = model(next_token, cache=cache)[:, -1]
+        out = model(token_ids, cache=cache)[:, -1]
+        for _ in range(max_new_tokens):    
+            orig_device = token_ids.device
+            if temperature is None or temperature == 0.0:
+                next_token = torch.argmax(out, dim=-1, keepdim=True)
+            else:
+                logits = scale_logits_by_temperature(out, temperature)
+                probas = torch.softmax(logits, dim=-1)
+                # NEW:
+                #########################################
+                probas = top_p_filter(probas, top_p)
+                #########################################
+                next_token = torch.multinomial(probas.cpu(), num_samples=1)
+                next_token = next_token.to(orig_device)
+
+            if (eos_token_id is not None and torch.all(next_token == eos_token_id)):
+                break
+            
+            generated_tokens.append(next_token)
+            
+            yield next_token
+            out = model(next_token, cache=cache)[:, -1]
+    finally:
+        output_token_ids = torch.cat(generated_tokens, dim=1) if generated_tokens else token_ids[:, :0]
+        generate_stats(output_token_ids, start_time, time.time())
 
 # Self-consistency voting mechanism for multiple generated answers
 def self_consistency_vote(
@@ -762,4 +800,86 @@ def self_consistency_vote(
     "majority_winners": majority_winners,
     "final_answer": final_answer,
     }
+
+def heuristic_score(
+    answer,
+    prompt=None,
+    brevity_bonus=500.0,
+    boxed_bonus=2.0,
+    extract_bonus=1.0,
+    fulltext_bonus=0.0,
+):
+    score = 0.0
+    cand = extract_final_candidate(answer, fallback="none")
+    if cand:
+        score += boxed_bonus
+    else:
+        cand = extract_final_candidate(answer, fallback="number_only")
+        if cand:
+            score += extract_bonus
+        else:
+            cand = extract_final_candidate(
+                answer, fallback="number_then_full"
+            )
+            if cand:
+                score += fulltext_bonus
+    score += 1.5 * math.exp(-len(answer) / brevity_bonus)
+    return score
+
+# Calculating next-token probabilities
+@torch.inference_mode()
+def calc_next_token_probas(model, tokenizer, prompt, device, show=True):
+    token_ids = torch.tensor(tokenizer.encode(prompt)).unsqueeze(0).to(device)
+    logits = model(token_ids).squeeze(0)
+    all_probas = torch.softmax(logits, dim=-1)
+
+    t_idx = torch.arange(0, token_ids.shape[0] - 1, device=device)
+    next_ids = token_ids[1:]
+    next_token_probas = all_probas[t_idx, next_ids]
+    prod_next_token_probas = torch.prod(next_token_probas)
+    if show:
+        print("Next-token probabilities:", next_token_probas)
+        print("Joint probability:", prod_next_token_probas)
+    else:
+        return next_token_probas, prod_next_token_probas
+
+# Calculating next-token log probabilities
+@torch.inference_mode()
+def calc_next_token_logprobas(model, tokenizer, prompt, device, show=True):
+
+    token_ids = torch.tensor(tokenizer.encode(prompt), device=device)
+    
+    logits = model(token_ids.unsqueeze(0)).squeeze(0)
+    all_logprobas = torch.log_softmax(logits, dim=-1)
+
+    t_idx = torch.arange(0, token_ids.shape[0] - 1, device=device)
+    next_ids = token_ids[1:]
+    next_token_logprobas = all_logprobas[t_idx, next_ids]
+
+    sum_next_token_logprobas = torch.sum(next_token_logprobas)
+    
+    if show:
+        print("Next-token log probabilities:", next_token_logprobas)
+        print("Joint log probability:", sum_next_token_logprobas)
+    else:
+        return next_token_logprobas, sum_next_token_logprobas
+
+# Average log-probability scoring for answer tokens
+@torch.inference_mode()
+def avg_logprob_answer(model, tokenizer, prompt, answer, device="cpu"):
  
+    prompt_ids = tokenizer.encode(prompt)
+    answer_ids = tokenizer.encode(answer)
+    full_ids = torch.tensor(prompt_ids + answer_ids, device=device)
+ 
+    logits = model(full_ids.unsqueeze(0)).squeeze(0)
+    logprobs = torch.log_softmax(logits, dim=-1)
+ 
+    start = len(prompt_ids) - 1
+    end = full_ids.shape[0] - 1
+ 
+    t_idx = torch.arange(start, end, device=device)
+    next_tokens = full_ids[start + 1 : end + 1]
+    next_token_logps = logprobs[t_idx, next_tokens]
+ 
+    return torch.mean(next_token_logps)
