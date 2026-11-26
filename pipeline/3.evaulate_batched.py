@@ -2,7 +2,7 @@ import argparse
 import json
 import time
 from pathlib import Path
-from reasoning_from_scratch.utils import extract_final_candidate,grade_answer,eta_progress_message,get_device,load_math500_data
+from reasoning_from_scratch.utils import extract_final_candidate,grade_answer,eta_progress_message,get_device, load_math_data
 # from reasoning_from_scratch.constants import *
 from reasoning_from_scratch.qwen3_batched import *
 
@@ -183,7 +183,8 @@ if __name__ == "__main__":
     dev_name = str(device).replace(":", "-")
     print("Batch size:", args.batch_size)
 
-    math_data = load_math500_data()[:args.dataset_size]
+    math_data = load_math_data(file="math_test_500.json")[:args.dataset_size]
+    # math_data = load_math_data(local_path="../downloads/math_test_500.json",save_copy=True,dataset="nlile/hendrycks-MATH-benchmark")[:args.dataset_size]
 
     model, tokenizer = load_model_and_tokenizer(args.kind, device, use_compile=args.compile, local_dir=str(downloads_dir))
 
