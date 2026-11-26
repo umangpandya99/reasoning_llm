@@ -335,7 +335,6 @@ def normalize_text(text):
         lambda match: "+" + match.group(1),
         text,
     )
-
     text = re.sub(
         r"(?<=\d),(?=\d\d\d(\D|$))",
         "",
@@ -404,13 +403,46 @@ def grade_answer(pred_text, gt_text):
             )
     return result 
 
+def load_math_data(save_copy=True, dataset=None,file="math_train_12000.json"):
+    repo_root = Path(__file__).resolve().parents[1]
+    downloads_dir = repo_root / "downloads"
+
+    # 1. Load from local file if it exists
+    if downloads_dir.exists() and (downloads_dir / file).exists():
+        with (downloads_dir / file).open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    else:
+        # 2. Download from Hugging Face
+        if dataset is None:
+            dataset="nlile/hendrycks-MATH-benchmark"
+
+        dataset_dict = load_dataset(dataset)
+        train_split = dataset_dict["train"]
+        test_split = dataset_dict["test"]
+
+        data = train_split.to_list() if hasattr(train_split, "to_list") else list(train_split)
+
+        if save_copy:
+            downloads_dir.mkdir(parents=True, exist_ok=True)
+
+            with (downloads_dir / file).open("w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+
+            test_path = downloads_dir / "math_test_500.json"
+            test_data = test_split.to_list() if hasattr(test_split, "to_list") else list(test_split)
+            with test_path.open("w", encoding="utf-8") as f:
+                json.dump(test_data, f, ensure_ascii=False, indent=2)
+
+    return data
+    
 # Load the MATH-500 test dataset, either from a local file or by downloading it from Hugging Face
-def load_math500_data(local_path="../downloads/math500_test.json", save_copy=True):
-    local_path = Path(local_path)
+def load_math500_data(save_copy=True):
+    repo_root = Path(__file__).resolve().parents[1]
+    local_path = repo_root / "downloads"
 
     # 1. Load from local file if it exists
     if local_path.exists():
-        with local_path.open("r", encoding="utf-8") as f:
+        with (local_path / "math500_test.json").open("r", encoding="utf-8") as f:
             math_data = json.load(f)
     else:
         # 2. Download from Hugging Face
@@ -1017,3 +1049,250 @@ def self_refinement_loop(
         "final_extracted": current_extracted,
         "steps": steps,
     }
+
+# Defining the rollout generation function
+@torch.no_grad()
+def sample_response(
+    model,
+    tokenizer,
+    prompt,
+    device,
+    max_new_tokens=512,
+    temperature=0.8,
+    top_p=0.9,
+):
+    input_ids = torch.tensor(
+    tokenizer.encode(prompt),
+    device=device
+    )
+    cache = KVCache(n_layers=model.cfg["n_layers"])
+    model.reset_kv_cache()
+    logits = model(input_ids.unsqueeze(0), cache=cache)[:, -1]
+
+    generated = []
+    for _ in range(max_new_tokens):
+        if temperature and temperature != 1.0:
+            logits = logits / temperature
+    
+        probas = torch.softmax(logits, dim=-1)
+        probas = top_p_filter(probas, top_p)
+        next_token = torch.multinomial(
+        probas.cpu(), num_samples=1
+        ).to(device)
+    
+        token_id = next_token.item()
+        generated.append(token_id)
+
+        if (
+            tokenizer.eos_token_id is not None
+            and token_id == tokenizer.eos_token_id):
+            break
+        logits = model(next_token, cache=cache)[:, -1]
+    full_token_ids = torch.cat(
+        [input_ids,
+        torch.tensor(generated, device=device, dtype=input_ids.dtype),]
+    )
+    return full_token_ids, input_ids.numel(), tokenizer.decode(generated)
+
+# Defining the reward function for RL with value refinement
+def reward_rlvr(answer_text, ground_truth):
+    extracted = extract_final_candidate(
+    answer_text, fallback=None
+)
+    if not extracted:
+        return 0.0
+    correct = grade_answer(extracted, ground_truth)
+    return float(correct)
+
+# Computing sequence-level log probabilities
+def sequence_logprob(model, token_ids, prompt_len):
+    logits = model(token_ids.unsqueeze(0)).squeeze(0).float()
+    logprobs = torch.log_softmax(logits, dim=-1)
+    selected = logprobs[:-1].gather(
+    1, token_ids[1:].unsqueeze(-1)
+    ).squeeze(-1)
+    return torch.sum(selected[prompt_len - 1:])
+
+# Combining all the GRPO stages
+def compute_grpo_loss(
+    model,
+    tokenizer,
+    example,
+    device,
+    num_rollouts=2,
+    max_new_tokens=256,
+    temperature=0.8,
+    top_p=0.9,
+):
+    assert num_rollouts >= 2
+    roll_logps, roll_rewards, samples = [], [], []
+    prompt = render_template(example["problem"])
+    
+    was_training = model.training
+    model.eval()
+    
+    for _ in range(num_rollouts):
+        token_ids, prompt_len, text = sample_response(
+            model=model,
+            tokenizer=tokenizer,
+            prompt=prompt,
+            device=device,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+        )
+
+        reward = reward_rlvr(text, example["answer"])
+
+        logp = sequence_logprob(model, token_ids, prompt_len)
+        
+        roll_logps.append(logp)
+        roll_rewards.append(reward)
+        samples.append(
+            {
+                "text": text,
+                "reward": reward,
+                "gen_len": token_ids.numel() - prompt_len,
+            }
+        )
+
+    if was_training:
+        model.train()
+
+    rewards = torch.tensor(roll_rewards, device=device)
+
+    advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-4)
+
+    logps = torch.stack(roll_logps)
+    
+    pg_loss = -(advantages.detach() * logps).mean()
+    loss = pg_loss # In the next chapter we add a KL term here
+    
+    return {
+    "loss": loss.item(),
+    "pg_loss": pg_loss.item(),
+    "rewards": roll_rewards,
+    "advantages": advantages.detach().cpu().tolist(),
+    "samples": samples,
+    "loss_tensor": loss,
+    }
+
+# Implementing the RLVR training loop
+def train_rlvr_grpo(
+    model,
+    tokenizer,
+    math_data,
+    device,
+    steps=None,
+    num_rollouts=2,
+    max_new_tokens=256,
+    temperature=0.8,
+    top_p=0.9,
+    lr=1e-5,
+    checkpoint_every=50,
+    checkpoint_dir=".",
+    csv_log_path=None,
+):
+    repo_root = Path(__file__).resolve().parents[1]
+    checkpoint_dir = repo_root / checkpoint_dir
+    print(f"Checkpoint directory: {checkpoint_dir}")
+
+    if steps is None:
+        steps = len(math_data)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    model.train()
+    current_step = 0
+
+    if csv_log_path is None:
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        csv_log_path = f"{checkpoint_dir}/train_rlvr_grpo_metrics_{timestamp}.csv"
+    csv_log_path = Path(csv_log_path)
+
+    try:
+
+        for step in range(steps):
+
+            optimizer.zero_grad()
+            current_step = step + 1
+            example = math_data[step % len(math_data)]
+
+            stats = compute_grpo_loss(
+            model=model,
+            tokenizer=tokenizer,
+            example=example,
+            device=device,
+            num_rollouts=num_rollouts,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            )
+
+            stats["loss_tensor"].backward()
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+            optimizer.step()
+
+            reward_avg = torch.tensor(stats["rewards"]).mean().item()
+            step_tokens = sum(
+                sample["gen_len"] for sample in stats["samples"]
+            )
+            avg_response_len = (
+                step_tokens / len(stats["samples"]) if stats["samples"] else 0.0
+            )
+            append_csv_metrics(
+                csv_log_path, current_step, steps,
+                stats["loss"], reward_avg, avg_response_len,
+            )
+            print(
+                f"[Step {current_step}/{steps}] "
+                f"loss={stats['loss']:.4f} "
+                f"reward_avg={reward_avg:.3f} "
+                f"avg_resp_len={avg_response_len:.1f}"
+            )
+
+            if checkpoint_every and current_step % checkpoint_every == 0:
+                ckpt_path = save_checkpoint(
+                    model=model,
+                    checkpoint_dir=checkpoint_dir,
+                    step=current_step,
+                )
+                print(f"Saved checkpoint to {ckpt_path}")
+    except KeyboardInterrupt:
+        ckpt_path = save_checkpoint(
+        model=model,
+        checkpoint_dir=checkpoint_dir,
+        step=max(1, current_step),
+        suffix="interrupt",
+        )
+        print(f"\nKeyboardInterrupt. Saved checkpoint to {ckpt_path}")
+        return model
+    
+    return model
+
+def save_checkpoint(model, checkpoint_dir, step, suffix=""):
+    checkpoint_dir = Path(checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    suffix = f"-{suffix}" if suffix else ""
+    ckpt_path = (
+    checkpoint_dir /
+    f"qwen3-0.6B-rlvr-grpo-step{step:05d}{suffix}.pth"
+    )
+    torch.save(model.state_dict(), ckpt_path)
+    return ckpt_path
+
+def append_csv_metrics(
+ csv_log_path, step_idx, total_steps,
+ loss, reward_avg, avg_response_len,
+):
+ if not csv_log_path.exists():
+    csv_log_path.write_text(
+        "step,total_steps,loss,reward_avg,avg_response_len\n",
+        encoding="utf-8",
+    )
+ with csv_log_path.open("a", encoding="utf-8") as f:
+    f.write(
+        f"{step_idx},{total_steps},{loss:.6f},{reward_avg:.6f},"
+        f"{avg_response_len:.6f}\n"
+    )
